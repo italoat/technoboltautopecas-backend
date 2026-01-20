@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
 from pymongo import MongoClient
-from pymongo.errors import OperationFailure, ServerSelectionTimeoutError
+from pymongo.errors import OperationFailure
 from dotenv import load_dotenv
 
 # Carrega variáveis de ambiente
@@ -24,25 +24,28 @@ mongo_user = quote_plus(os.getenv('MONGO_USER', ''))
 mongo_pass = quote_plus(os.getenv('MONGO_PASS', ''))
 mongo_host = os.getenv('MONGO_HOST', '')
 
+# Construção da URI
 if not mongo_host:
-    MONGO_URI = "mongodb://localhost:27017" # Fallback local caso ENV falhe
+    MONGO_URI = "mongodb://localhost:27017"
 else:
     MONGO_URI = f"mongodb+srv://{mongo_user}:{mongo_pass}@{mongo_host}/?retryWrites=true&w=majority"
 
-# Configuração das 7 Chaves Gemini para Rodízio
+# Configuração das chaves Gemini
 GEMINI_KEYS = [os.getenv(f"GEMINI_CHAVE_{i}") for i in range(1, 8)]
 VALID_GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 
 # --- INICIALIZAÇÃO DO BANCO DE DADOS ---
 db_status = "Desconectado"
+parts_collection = None
+users_collection = None
+
 try:
-    # Timeout de 5s para não travar o deploy se o Mongo estiver fora
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    db = client.technoboltauto        # Seu banco de dados
-    parts_collection = db.estoque     # Sua coleção de peças
-    users_collection = db.usuarios    # Sua coleção de usuários
+    db = client.technoboltauto        
+    parts_collection = db.estoque     
+    users_collection = db.usuarios    
     
-    # Teste de conexão/permissão
+    # Teste de conexão
     client.admin.command('ping')
     db_status = "Conectado e Operacional"
     print("✅ MongoDB Atlas: Conexão estabelecida com sucesso!")
@@ -55,7 +58,10 @@ except Exception as e:
 
 # --- SEED DE DADOS (POPULAÇÃO INICIAL) ---
 def seed_data():
-    if not parts_collection: return
+    # CORREÇÃO 1: Verificação explícita de None
+    if parts_collection is None: 
+        return
+        
     try:
         # Só popula se a coleção estiver vazia
         if parts_collection.count_documents({}) == 0:
@@ -76,7 +82,7 @@ seed_data()
 # --- MIDDLEWARE (CORS) ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # Em produção, substitua pela URL da Vercel
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -91,7 +97,6 @@ class LoginRequest(BaseModel):
 
 @app.get("/")
 def health_check():
-    """Verifica se o servidor e o banco estão respondendo"""
     return {
         "service": "TechnoBolt Backend",
         "status": "online",
@@ -101,8 +106,8 @@ def health_check():
 
 @app.post("/api/login")
 def login(data: LoginRequest):
-    """Realiza autenticação e retorna lojas permitidas"""
-    if not users_collection:
+    # CORREÇÃO 2: Verificação explícita de None
+    if users_collection is None:
         raise HTTPException(status_code=503, detail="Banco de dados indisponível")
     
     user = users_collection.find_one({"username": data.username, "password": data.password})
@@ -113,18 +118,17 @@ def login(data: LoginRequest):
         "name": user.get("name"),
         "role": user.get("role", "vendedor"),
         "allowed_stores": user.get("allowed_stores", []),
-        "token": "bolt_session_active" # Token simplificado para MVP
+        "token": "bolt_session_active"
     }
 
 @app.get("/api/parts")
 def get_parts(q: Optional[str] = None):
-    """Busca peças no estoque com suporte a filtros"""
-    if not parts_collection:
+    # CORREÇÃO 3: Verificação explícita de None
+    if parts_collection is None:
         return []
     
     query = {}
     if q:
-        # Busca insensível a maiúsculas/minúsculas em nome, código ou marca
         query = {
             "$or": [
                 {"name": {"$regex": q, "$options": "i"}},
@@ -137,7 +141,7 @@ def get_parts(q: Optional[str] = None):
         cursor = parts_collection.find(query).limit(50)
         parts = []
         for p in cursor:
-            p["id"] = str(p.pop("_id")) # Converte ID do Mongo para String
+            p["id"] = str(p.pop("_id"))
             parts.append(p)
         return parts
     except Exception:
@@ -145,12 +149,10 @@ def get_parts(q: Optional[str] = None):
 
 @app.post("/api/ai/identify")
 async def identify_part(file: UploadFile = File(...)):
-    """Vision AI: Identifica peça via foto usando rodízio de chaves Gemini"""
     if not VALID_GEMINI_KEYS:
         raise HTTPException(status_code=500, detail="Configuração de IA ausente")
     
     try:
-        # Escolhe uma chave aleatória das 7 disponíveis para distribuir carga
         api_key = random.choice(VALID_GEMINI_KEYS)
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel('gemini-1.5-flash')
@@ -174,7 +176,6 @@ async def identify_part(file: UploadFile = File(...)):
             {"mime_type": file.content_type, "data": image_content}
         ])
         
-        # Limpa possíveis blocos de código markdown que a IA possa enviar
         clean_json = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(clean_json)
         
@@ -182,8 +183,7 @@ async def identify_part(file: UploadFile = File(...)):
         print(f"❌ Erro na IA: {e}")
         raise HTTPException(status_code=500, detail="Falha ao processar imagem")
 
-# --- EXECUÇÃO ---
 if __name__ == "__main__":
     import uvicorn
-    # O Render detecta a porta automaticamente via variável PORT
+    # A porta precisa ser 0.0.0.0 para o Render acessá-la externamente
     uvicorn.run(app, host="0.0.0.0", port=PORT)
