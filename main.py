@@ -47,6 +47,7 @@ db_status = "Desconectado"
 parts_collection = None
 users_collection = None
 transfers_collection = None
+sales_collection = None
 db = None
 
 try:
@@ -55,6 +56,7 @@ try:
     parts_collection = db.estoque     
     users_collection = db.usuarios
     transfers_collection = db.transferencias
+    sales_collection = db.vendas
     
     client.admin.command('ping')
     db_status = "Conectado e Operacional"
@@ -70,14 +72,22 @@ class LoginRequest(BaseModel):
 
 class SaleItem(BaseModel):
     part_id: str
+    name: str # Adicionado para visualização
     quantity: int
     unit_price: float
 
-class SaleRequest(BaseModel):
+class SaleCreateRequest(BaseModel):
     store_id: int
+    seller_name: str
+    client_name: str
+    discount_percent: float
     items: List[SaleItem]
-    payment_method: str
+    subtotal: float
     total: float
+
+class SaleFinalizeRequest(BaseModel):
+    sale_id: str
+    payment_method: str
 
 class TransferRequest(BaseModel):
     part_id: str
@@ -92,7 +102,7 @@ class TransferStatusUpdate(BaseModel):
     new_status: str # APROVADO, REJEITADO, TRANSITO, CONCLUIDO
     user_id: str
 
-# --- ROTAS ---
+# --- ROTAS GERAIS ---
 
 @app.get("/")
 def health_check():
@@ -140,7 +150,7 @@ def get_parts(q: Optional[str] = None):
         cursor = parts_collection.find(query).limit(50)
         parts = []
         for p in cursor:
-            # --- CORREÇÃO DE ESTOQUE (Força Conversão) ---
+            # --- CORREÇÃO DE ESTOQUE (Força Conversão Texto -> Int) ---
             estoque_rede = p.get("ESTOQUE_REDE", [])
             total_qtd = 0
             
@@ -148,10 +158,10 @@ def get_parts(q: Optional[str] = None):
                 for loja in estoque_rede:
                     raw_qtd = loja.get("qtd", 0)
                     try:
-                        # Tenta converter string para int (ex: "150" -> 150)
+                        # Converte string para int (ex: "150" -> 150) e ignora erros
                         total_qtd += int(raw_qtd)
                     except (ValueError, TypeError):
-                        pass # Ignora se não for número
+                        pass 
             
             parts.append({
                 "id": str(p.get("_id")),
@@ -214,22 +224,66 @@ async def identify_part(file: UploadFile = File(...)):
     
     return result_json
 
-@app.post("/api/sales/checkout")
-def checkout(sale: SaleRequest):
-    if parts_collection is None: raise HTTPException(503, "DB Offline")
+# --- ROTAS DE VENDAS (PDV -> CAIXA) ---
+
+# 1. PDV: Cria pré-venda (PENDENTE)
+@app.post("/api/sales/create")
+def create_sale(sale: SaleCreateRequest):
+    if sales_collection is None: raise HTTPException(503, "DB Offline")
+    
+    doc = sale.dict()
+    doc["status"] = "PENDENTE"
+    doc["created_at"] = datetime.now()
+    doc["payment_method"] = None
+    
+    result = sales_collection.insert_one(doc)
+    return {"status": "success", "sale_id": str(result.inserted_id)}
+
+# 2. CAIXA: Lista pendentes
+@app.get("/api/sales/pending")
+def list_pending_sales(store_id: int):
+    if sales_collection is None: return []
+    # Busca vendas pendentes desta loja
+    cursor = sales_collection.find({"store_id": store_id, "status": "PENDENTE"}).sort("created_at", -1)
+    sales = []
+    for s in cursor:
+        s["id"] = str(s["_id"])
+        del s["_id"]
+        sales.append(s)
+    return sales
+
+# 3. CAIXA: Finaliza e Baixa Estoque
+@app.post("/api/sales/finalize")
+def finalize_sale(req: SaleFinalizeRequest):
+    if sales_collection is None: raise HTTPException(503, "DB Offline")
+    
+    sale = sales_collection.find_one({"_id": ObjectId(req.sale_id)})
+    if not sale: raise HTTPException(404, "Venda não encontrada")
+    if sale["status"] == "FINALIZADA": raise HTTPException(400, "Venda já finalizada")
+
     try:
-        db.vendas.insert_one(sale.dict())
-        for item in sale.items:
+        # Baixa Estoque
+        for item in sale["items"]:
             parts_collection.update_one(
-                {"_id": ObjectId(item.part_id), "ESTOQUE_REDE.loja_id": sale.store_id},
-                {"$inc": {"ESTOQUE_REDE.$.qtd": -item.quantity}}
+                {"_id": ObjectId(item["part_id"]), "ESTOQUE_REDE.loja_id": sale["store_id"]},
+                {"$inc": {"ESTOQUE_REDE.$.qtd": -item["quantity"]}}
             )
+        
+        # Atualiza Venda
+        sales_collection.update_one(
+            {"_id": ObjectId(req.sale_id)},
+            {"$set": {
+                "status": "FINALIZADA", 
+                "payment_method": req.payment_method,
+                "finalized_at": datetime.now()
+            }}
+        )
         return {"status": "success"}
     except Exception as e:
-        print(f"Erro PDV: {e}")
-        raise HTTPException(500, "Erro ao processar venda")
+        print(f"Erro finalizar: {e}")
+        raise HTTPException(500, "Erro ao baixar estoque")
 
-# --- NOVAS ROTAS DE LOGÍSTICA ---
+# --- ROTAS DE LOGÍSTICA ---
 
 @app.post("/api/logistics/request")
 def request_transfer(req: TransferRequest):
