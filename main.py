@@ -33,7 +33,8 @@ else:
 GEMINI_KEYS = [os.getenv(f"GEMINI_CHAVE_{i}") for i in range(1, 8)]
 VALID_GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 
-# SEUS MOTORES (Mantidos)
+# --- SEUS MOTORES (ORDEM DE PREFERÊNCIA) ---
+# O sistema tentará o primeiro. Se falhar, tenta o próximo automaticamente.
 MY_ENGINES = [
     "models/gemini-3-flash-preview", 
     "models/gemini-2.5-flash", 
@@ -48,7 +49,7 @@ parts_collection = None
 users_collection = None
 transfers_collection = None
 sales_collection = None
-messages_collection = None # Nova coleção para Chat
+messages_collection = None
 db = None
 
 try:
@@ -58,7 +59,7 @@ try:
     users_collection = db.usuarios
     transfers_collection = db.transferencias
     sales_collection = db.vendas
-    messages_collection = db.mensagens # Chat
+    messages_collection = db.mensagens
     
     client.admin.command('ping')
     db_status = "Conectado e Operacional"
@@ -104,7 +105,6 @@ class TransferStatusUpdate(BaseModel):
     new_status: str # APROVADO, REJEITADO, TRANSITO, CONCLUIDO
     user_id: str
 
-# Novos Modelos
 class ChatMessage(BaseModel):
     user: str
     text: str
@@ -161,15 +161,13 @@ def get_parts(q: Optional[str] = None):
         cursor = parts_collection.find(query).limit(50)
         parts = []
         for p in cursor:
-            # --- CORREÇÃO DE ESTOQUE (Força Conversão Texto -> Int) ---
+            # Cálculo de Estoque
             estoque_rede = p.get("ESTOQUE_REDE", [])
             total_qtd = 0
-            
             if isinstance(estoque_rede, list):
                 for loja in estoque_rede:
                     raw_qtd = loja.get("qtd", 0)
                     try:
-                        # Converte string para int (ex: "150" -> 150) e ignora erros
                         total_qtd += int(raw_qtd)
                     except (ValueError, TypeError):
                         pass 
@@ -193,7 +191,7 @@ def get_parts(q: Optional[str] = None):
         print(f"Erro busca: {e}")
         return []
 
-# --- VISION AI ---
+# --- VISION AI (IDENTIFICADOR COM SEUS MOTORES) ---
 @app.post("/api/ai/identify")
 async def identify_part(file: UploadFile = File(...)):
     if not VALID_GEMINI_KEYS:
@@ -204,9 +202,10 @@ async def identify_part(file: UploadFile = File(...)):
     success = False
     result_json = {}
 
-    # Tenta seus motores em ordem
+    # Itera sobre seus motores até um funcionar
     for engine in MY_ENGINES:
         try:
+            print(f"Tentando motor Vision: {engine}...")
             api_key = random.choice(VALID_GEMINI_KEYS)
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel(engine)
@@ -225,49 +224,66 @@ async def identify_part(file: UploadFile = File(...)):
             if start != -1 and end != 0:
                 result_json = json.loads(text[start:end])
                 success = True
+                print(f"✅ Vision Sucesso com: {engine}")
                 break
         except Exception as e:
+            print(f"⚠️ Falha Vision {engine}: {e}")
             last_error = str(e)
             continue 
 
     if not success:
-        # Fallback de JSON vazio se falhar tudo
-        raise HTTPException(status_code=500, detail=f"Falha na IA: {last_error}")
+        raise HTTPException(status_code=500, detail=f"Falha na IA (Vision): {last_error}")
     
     return result_json
 
-# --- CONSULTOR IA (TEXTO) ---
+# --- CONSULTOR IA (CHAT COM SEUS MOTORES) ---
 @app.post("/api/ai/consult")
 def ai_consult(req: AIChatRequest):
     if not VALID_GEMINI_KEYS:
         raise HTTPException(status_code=500, detail="Sem chaves configuradas")
     
-    try:
-        api_key = random.choice(VALID_GEMINI_KEYS)
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        sys_prompt = """
-        Você é o Consultor Técnico da TechnoBolt. 
-        Responda de forma concisa, técnica e útil para vendedores de autopeças.
-        Foque em especificações, compatibilidade e dicas de manutenção.
-        """
-        
-        full_prompt = f"{sys_prompt}\n\nPergunta do usuário: {req.prompt}"
-        response = model.generate_content(full_prompt)
-        
-        return {"response": response.text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    success = False
+    response_text = ""
+    last_error = ""
 
-# --- CRM (AGREGAÇÃO DE VENDAS) ---
+    sys_prompt = """
+    Você é o Consultor Técnico da TechnoBolt. 
+    Responda de forma concisa, técnica e útil para vendedores de autopeças.
+    Foque em especificações, compatibilidade e dicas de manutenção.
+    """
+    full_prompt = f"{sys_prompt}\n\nPergunta do usuário: {req.prompt}"
+
+    # Itera sobre seus motores até um funcionar
+    for engine in MY_ENGINES:
+        try:
+            print(f"Tentando motor Chat: {engine}...")
+            api_key = random.choice(VALID_GEMINI_KEYS)
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(engine)
+            
+            response = model.generate_content(full_prompt)
+            response_text = response.text
+            success = True
+            print(f"✅ Chat Sucesso com: {engine}")
+            break 
+        except Exception as e:
+            print(f"⚠️ Falha Chat {engine}: {e}")
+            last_error = str(e)
+            continue 
+
+    if not success:
+        # Retorna 500 apenas se TODOS falharem
+        raise HTTPException(status_code=500, detail=f"IA Indisponível (Todos os motores falharam): {last_error}")
+
+    return {"response": response_text}
+
+# --- CRM ---
 @app.get("/api/crm/clients")
 def get_crm_clients():
     if sales_collection is None: return []
     
-    # Agrega vendas por nome de cliente para criar perfil
     pipeline = [
-        {"$match": {"client_name": {"$ne": "Consumidor Final"}}}, # Ignora anônimos
+        {"$match": {"client_name": {"$ne": "Consumidor Final"}}},
         {"$group": {
             "_id": "$client_name",
             "total_spent": {"$sum": "$total"},
@@ -280,7 +296,6 @@ def get_crm_clients():
     
     try:
         results = list(sales_collection.aggregate(pipeline))
-        # Formata para o frontend
         clients = []
         for r in results:
             clients.append({
@@ -298,40 +313,31 @@ def get_crm_clients():
 @app.get("/api/chat/messages")
 def get_chat_messages():
     if messages_collection is None: return []
-    # Pega as últimas 50 mensagens
     cursor = messages_collection.find().sort("timestamp", -1).limit(50)
     msgs = list(cursor)
-    msgs.reverse() # Inverte para mostrar as mais antigas no topo
-    
+    msgs.reverse()
     return [{"id": str(m["_id"]), "user": m["user"], "text": m["text"], "timestamp": m["timestamp"]} for m in msgs]
 
 @app.post("/api/chat/messages")
 def post_chat_message(msg: ChatMessage):
     if messages_collection is None: raise HTTPException(503, "DB Offline")
-    
     messages_collection.insert_one(msg.dict())
     return {"status": "sent"}
 
-# --- ROTAS DE VENDAS (PDV -> CAIXA) ---
-
-# 1. PDV: Cria pré-venda (PENDENTE)
+# --- VENDAS ---
 @app.post("/api/sales/create")
 def create_sale(sale: SaleCreateRequest):
     if sales_collection is None: raise HTTPException(503, "DB Offline")
-    
     doc = sale.dict()
     doc["status"] = "PENDENTE"
     doc["created_at"] = datetime.now()
     doc["payment_method"] = None
-    
     result = sales_collection.insert_one(doc)
     return {"status": "success", "sale_id": str(result.inserted_id)}
 
-# 2. CAIXA: Lista pendentes
 @app.get("/api/sales/pending")
 def list_pending_sales(store_id: int):
     if sales_collection is None: return []
-    # Busca vendas pendentes desta loja
     cursor = sales_collection.find({"store_id": store_id, "status": "PENDENTE"}).sort("created_at", -1)
     sales = []
     for s in cursor:
@@ -340,43 +346,32 @@ def list_pending_sales(store_id: int):
         sales.append(s)
     return sales
 
-# 3. CAIXA: Finaliza e Baixa Estoque
 @app.post("/api/sales/finalize")
 def finalize_sale(req: SaleFinalizeRequest):
     if sales_collection is None: raise HTTPException(503, "DB Offline")
-    
     sale = sales_collection.find_one({"_id": ObjectId(req.sale_id)})
     if not sale: raise HTTPException(404, "Venda não encontrada")
     if sale["status"] == "FINALIZADA": raise HTTPException(400, "Venda já finalizada")
 
     try:
-        # Baixa Estoque
         for item in sale["items"]:
             parts_collection.update_one(
                 {"_id": ObjectId(item["part_id"]), "ESTOQUE_REDE.loja_id": sale["store_id"]},
                 {"$inc": {"ESTOQUE_REDE.$.qtd": -item["quantity"]}}
             )
-        
-        # Atualiza Venda
         sales_collection.update_one(
             {"_id": ObjectId(req.sale_id)},
-            {"$set": {
-                "status": "FINALIZADA", 
-                "payment_method": req.payment_method,
-                "finalized_at": datetime.now()
-            }}
+            {"$set": {"status": "FINALIZADA", "payment_method": req.payment_method, "finalized_at": datetime.now()}}
         )
         return {"status": "success"}
     except Exception as e:
         print(f"Erro finalizar: {e}")
         raise HTTPException(500, "Erro ao baixar estoque")
 
-# --- ROTAS DE LOGÍSTICA ---
-
+# --- LOGÍSTICA ---
 @app.post("/api/logistics/request")
 def request_transfer(req: TransferRequest):
     if transfers_collection is None: raise HTTPException(503, "DB Offline")
-    
     part = parts_collection.find_one({"_id": ObjectId(req.part_id)})
     part_name = part.get("PRODUTO_NOME") if part else "Desconhecido"
     part_image = part.get("IMAGEM_URL") if part else ""
@@ -402,7 +397,6 @@ def list_transfers(store_id: int):
     cursor = transfers_collection.find({
         "$or": [{"from_store_id": int(store_id)}, {"to_store_id": int(store_id)}]
     }).sort("created_at", -1)
-    
     results = []
     for doc in cursor:
         doc["id"] = str(doc["_id"])
@@ -424,26 +418,19 @@ def update_status(data: TransferStatusUpdate):
     part_oid = ObjectId(transfer["part_id"])
 
     if new_status == "APROVADO": 
-        # Verifica Saldo
         part = parts_collection.find_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": from_id}, {"ESTOQUE_REDE.$": 1})
         if not part: raise HTTPException(400, "Origem sem estoque")
         
-        # Converte para int seguro
-        try:
-            curr_qtd = int(part["ESTOQUE_REDE"][0].get("qtd", 0))
-        except:
-            curr_qtd = 0
+        try: curr_qtd = int(part["ESTOQUE_REDE"][0].get("qtd", 0))
+        except: curr_qtd = 0
 
         if curr_qtd < qty: raise HTTPException(400, f"Saldo insuficiente. Disp: {curr_qtd}")
 
         if transfer["type"] == "RETIRADA":
-            # Baixa Origem
             parts_collection.update_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": from_id}, {"$inc": {"ESTOQUE_REDE.$.qtd": -qty}})
-            # Credita Destino
             _credit_dest(part_oid, to_id, qty)
             new_status = "CONCLUIDO"
         else:
-            # Baixa Origem (Reserva)
             parts_collection.update_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": from_id}, {"$inc": {"ESTOQUE_REDE.$.qtd": -qty}})
             new_status = "SEPARACAO"
     
