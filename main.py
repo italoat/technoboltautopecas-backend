@@ -9,6 +9,7 @@ from pydantic import BaseModel
 import google.generativeai as genai
 from pymongo import MongoClient
 from pymongo.errors import OperationFailure
+from bson.objectid import ObjectId
 from dotenv import load_dotenv
 
 # Carrega variáveis de ambiente
@@ -38,6 +39,7 @@ VALID_GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 db_status = "Desconectado"
 parts_collection = None
 users_collection = None
+db = None
 
 try:
     client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
@@ -58,7 +60,6 @@ except Exception as e:
 
 # --- SEED DE DADOS (POPULAÇÃO INICIAL) ---
 def seed_data():
-    # CORREÇÃO 1: Verificação explícita de None
     if parts_collection is None: 
         return
         
@@ -93,6 +94,17 @@ class LoginRequest(BaseModel):
     username: str
     password: str
 
+class SaleItem(BaseModel):
+    part_id: str
+    quantity: int
+    unit_price: float
+
+class SaleRequest(BaseModel):
+    store_id: int       # ID da loja que está vendendo
+    items: List[SaleItem]
+    payment_method: str # "pix", "credit", "cash"
+    total: float
+
 # --- ROTAS DA API ---
 
 @app.get("/")
@@ -106,7 +118,6 @@ def health_check():
 
 @app.post("/api/login")
 def login(data: LoginRequest):
-    # CORREÇÃO 2: Verificação explícita de None
     if users_collection is None:
         raise HTTPException(status_code=503, detail="Banco de dados indisponível")
     
@@ -136,7 +147,7 @@ def get_parts(q: Optional[str] = None):
                 {"COD_FABRICANTE": {"$regex": q, "$options": "i"}},
                 {"SKU_ID": {"$regex": q, "$options": "i"}},
                 {"MARCA": {"$regex": q, "$options": "i"}},
-                {"COD_EQUIVALENTES": {"$regex": q, "$options": "i"}} # Busca dentro da lista de similares
+                {"COD_EQUIVALENTES": {"$regex": q, "$options": "i"}} 
             ]
         }
     
@@ -165,13 +176,13 @@ def get_parts(q: Optional[str] = None):
                 "brand": p.get("MARCA", "Genérica"),
                 "image": p.get("IMAGEM_URL", ""),
                 
-                # Campos de Preço (Enviando 'price' para compatibilidade com o card antigo)
+                # Campos de Preço (Enviando 'price' para compatibilidade com componentes legados)
                 "price": p.get("PRECO_VENDA", 0.0),       
                 "price_retail": p.get("PRECO_VENDA", 0.0), 
                 
-                # Campos de Estoque (Enviando 'quantity' com a SOMA TOTAL para o card não dar erro)
-                "quantity": total_qtd,      # <--- Isso corrige o "Sem estoque físico" no Desktop
-                "total_stock": total_qtd,   # <--- Usado pelo Vision/Mobile
+                # Campos de Estoque
+                "quantity": total_qtd,      # <--- Soma total para listagens Desktop
+                "total_stock": total_qtd,   # <--- Soma total para Vision/Mobile
                 "stock_locations": estoque_rede, # Detalhe por loja
                 
                 # Dados Extras
@@ -185,6 +196,37 @@ def get_parts(q: Optional[str] = None):
     except Exception as e:
         print(f"❌ Erro ao buscar peças: {e}")
         return []
+
+@app.post("/api/sales/checkout")
+def checkout(sale: SaleRequest):
+    if parts_collection is None:
+        raise HTTPException(status_code=503, detail="Banco de dados offline")
+        
+    try:
+        # 1. Registrar a Venda (Histórico)
+        sale_doc = sale.dict()
+        if db is not None:
+            # Se a coleção vendas não existir, o Mongo cria automaticamente
+            db.vendas.insert_one(sale_doc)
+        
+        # 2. Baixar Estoque (Atualizar ESTOQUE_REDE)
+        # Atualiza apenas a quantidade da loja específica onde a venda ocorreu
+        for item in sale.items:
+            parts_collection.update_one(
+                {
+                    "_id": ObjectId(item.part_id),
+                    "ESTOQUE_REDE.loja_id": sale.store_id
+                },
+                {
+                    "$inc": { "ESTOQUE_REDE.$.qtd": -item.quantity }
+                }
+            )
+            
+        return {"status": "success", "message": "Venda realizada e estoque atualizado"}
+        
+    except Exception as e:
+        print(f"Erro no checkout: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao processar venda")
 
 @app.post("/api/ai/identify")
 async def identify_part(file: UploadFile = File(...)):
@@ -204,6 +246,7 @@ async def identify_part(file: UploadFile = File(...)):
         Retorne OBRIGATORIAMENTE apenas um JSON puro:
         {
             "name": "Nome técnico da peça",
+            "part_number": "Código aproximado se visível",
             "possible_vehicles": ["Veículo A", "Veículo B"],
             "category": "Categoria da Peça",
             "confidence": "Alta/Média/Baixa"
