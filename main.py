@@ -91,7 +91,12 @@ class SaleCreateRequest(BaseModel):
 class SaleFinalizeRequest(BaseModel):
     sale_id: str
     payment_method: str
-
+    
+class FiscalUpdate(BaseModel):
+    part_id: str
+    ncm: str
+    cst: str
+    
 class TransferRequest(BaseModel):
     part_id: str
     from_store_id: int
@@ -141,6 +146,8 @@ def login(data: LoginRequest):
         "token": "bolt_session_active",
         "currentStore": {"id": user.get("allowed_stores", [1])[0], "name": "Loja Padrão"}
     }
+
+
 
 @app.get("/api/parts")
 def get_parts(q: Optional[str] = None):
@@ -236,6 +243,25 @@ async def identify_part(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Falha na IA (Vision): {last_error}")
     
     return result_json
+
+@app.post("/api/fiscal/update")
+def update_fiscal(data: FiscalUpdate):
+    if parts_collection is None: raise HTTPException(503, "DB Offline")
+    
+    # Atualiza o NCM e CST no banco
+    result = parts_collection.update_one(
+        {"_id": ObjectId(data.part_id)},
+        {"$set": {
+            "NCM": data.ncm,
+            "CST": data.cst,
+            # Se tiver NCM, remove flag de erro (opcional, depende da sua lógica)
+        }}
+    )
+    
+    if result.modified_count == 0:
+        raise HTTPException(404, "Produto não encontrado ou dados idênticos")
+        
+    return {"status": "success"}
 
 # --- CONSULTOR IA (CHAT COM SEUS MOTORES) ---
 @app.post("/api/ai/consult")
