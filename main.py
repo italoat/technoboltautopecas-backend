@@ -1,22 +1,24 @@
 import os
 import json
 import random
+import re
 from typing import List, Optional
 from urllib.parse import quote_plus
+from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
 from pymongo import MongoClient
 from bson.objectid import ObjectId
-from datetime import datetime
 from dotenv import load_dotenv
 
+# Carrega variáveis de ambiente
 load_dotenv()
 
 app = FastAPI(title="TechnoBolt Enterprise API")
 
-# --- CONFIGURAÇÕES ---
+# --- CONFIGURAÇÕES DE AMBIENTE ---
 PORT = int(os.environ.get("PORT", 10000))
 mongo_user = quote_plus(os.getenv('MONGO_USER', ''))
 mongo_pass = quote_plus(os.getenv('MONGO_PASS', ''))
@@ -27,9 +29,11 @@ if not mongo_host:
 else:
     MONGO_URI = f"mongodb+srv://{mongo_user}:{mongo_pass}@{mongo_host}/?retryWrites=true&w=majority"
 
+# Configuração das chaves Gemini
 GEMINI_KEYS = [os.getenv(f"GEMINI_CHAVE_{i}") for i in range(1, 8)]
 VALID_GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 
+# SEUS MOTORES (Mantidos)
 MY_ENGINES = [
     "models/gemini-3-flash-preview", 
     "models/gemini-2.5-flash", 
@@ -38,11 +42,11 @@ MY_ENGINES = [
     "gemini-1.5-flash"
 ]
 
-# --- BANCO DE DADOS ---
+# --- INICIALIZAÇÃO DO BANCO DE DADOS ---
 db_status = "Desconectado"
 parts_collection = None
 users_collection = None
-transfers_collection = None # Nova coleção
+transfers_collection = None
 db = None
 
 try:
@@ -50,15 +54,16 @@ try:
     db = client.technoboltauto        
     parts_collection = db.estoque     
     users_collection = db.usuarios
-    transfers_collection = db.transferencias # <--- Coleção de Pedidos de Transferência
+    transfers_collection = db.transferencias
+    
     client.admin.command('ping')
     db_status = "Conectado e Operacional"
-    print("✅ MongoDB Atlas: Conexão estabelecida!")
+    print("✅ MongoDB Atlas: Conexão estabelecida com sucesso!")
 except Exception as e:
     db_status = f"Erro de Conexão: {str(e)}"
     print(f"❌ Falha ao conectar no MongoDB: {e}")
 
-# --- MODELS ---
+# --- MODELS (PYDANTIC) ---
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -74,7 +79,6 @@ class SaleRequest(BaseModel):
     payment_method: str
     total: float
 
-# Modelo atualizado para o novo fluxo
 class TransferRequest(BaseModel):
     part_id: str
     from_store_id: int
@@ -92,122 +96,169 @@ class TransferStatusUpdate(BaseModel):
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "db": db_status}
+    return {
+        "service": "TechnoBolt Backend",
+        "status": "online",
+        "database": db_status,
+        "ai_keys_active": len(VALID_GEMINI_KEYS)
+    }
 
 @app.post("/api/login")
 def login(data: LoginRequest):
-    if users_collection is None: raise HTTPException(503, "DB Offline")
+    if users_collection is None:
+        raise HTTPException(status_code=503, detail="Banco de dados indisponível")
+    
     user = users_collection.find_one({"username": data.username, "password": data.password})
-    if not user: raise HTTPException(401, "Credenciais inválidas")
+    if not user:
+        raise HTTPException(status_code=401, detail="Usuário ou senha incorretos")
+    
     return {
         "name": user.get("name"),
         "role": user.get("role", "vendedor"),
         "allowed_stores": user.get("allowed_stores", []),
         "token": "bolt_session_active",
-        "currentStore": {"id": user.get("allowed_stores", [1])[0], "name": "Loja Padrão"} # Mock simples
+        "currentStore": {"id": user.get("allowed_stores", [1])[0], "name": "Loja Padrão"}
     }
 
 @app.get("/api/parts")
 def get_parts(q: Optional[str] = None):
     if parts_collection is None: return []
+    
     query = {}
     if q:
-        query = {"$or": [
-            {"PRODUTO_NOME": {"$regex": q, "$options": "i"}},
-            {"COD_FABRICANTE": {"$regex": q, "$options": "i"}},
-            {"SKU_ID": {"$regex": q, "$options": "i"}},
-            {"MARCA": {"$regex": q, "$options": "i"}}
-        ]}
+        query = {
+            "$or": [
+                {"PRODUTO_NOME": {"$regex": q, "$options": "i"}},
+                {"COD_FABRICANTE": {"$regex": q, "$options": "i"}},
+                {"SKU_ID": {"$regex": q, "$options": "i"}},
+                {"MARCA": {"$regex": q, "$options": "i"}},
+                {"COD_EQUIVALENTES": {"$regex": q, "$options": "i"}}
+            ]
+        }
+    
     try:
         cursor = parts_collection.find(query).limit(50)
         parts = []
         for p in cursor:
+            # --- CORREÇÃO DE ESTOQUE (Força Conversão) ---
             estoque_rede = p.get("ESTOQUE_REDE", [])
-            total_qtd = sum([int(l.get("qtd", 0)) for l in estoque_rede if isinstance(l.get("qtd"), (int, float))])
+            total_qtd = 0
+            
+            if isinstance(estoque_rede, list):
+                for loja in estoque_rede:
+                    raw_qtd = loja.get("qtd", 0)
+                    try:
+                        # Tenta converter string para int (ex: "150" -> 150)
+                        total_qtd += int(raw_qtd)
+                    except (ValueError, TypeError):
+                        pass # Ignora se não for número
+            
             parts.append({
                 "id": str(p.get("_id")),
                 "name": p.get("PRODUTO_NOME", "Nome Indisponível"),
-                "code": p.get("COD_FABRICANTE", ""),
+                "code": p.get("COD_FABRICANTE", p.get("SKU_ID", "")),
+                "brand": p.get("MARCA", "Genérica"),
                 "image": p.get("IMAGEM_URL", ""),
                 "price": p.get("PRECO_VENDA", 0.0),
-                "total_stock": total_qtd,
-                "stock_locations": estoque_rede
+                "price_retail": p.get("PRECO_VENDA", 0.0),
+                "quantity": total_qtd,      
+                "total_stock": total_qtd,   
+                "stock_locations": estoque_rede,
+                "application": p.get("APLICACAO_VEICULOS", "Aplicação não informada"),
+                "category": p.get("CATEGORIA", "Geral")
             })
         return parts
     except Exception as e:
-        print(e)
+        print(f"Erro busca: {e}")
         return []
 
 @app.post("/api/ai/identify")
 async def identify_part(file: UploadFile = File(...)):
-    if not VALID_GEMINI_KEYS: raise HTTPException(500, "Sem chaves IA")
-    image_content = await file.read()
+    if not VALID_GEMINI_KEYS:
+        raise HTTPException(status_code=500, detail="Serviço de IA não configurado.")
     
+    image_content = await file.read()
+    last_error = ""
+    success = False
+    result_json = {}
+
+    # Tenta seus motores em ordem
     for engine in MY_ENGINES:
         try:
-            genai.configure(api_key=random.choice(VALID_GEMINI_KEYS))
+            api_key = random.choice(VALID_GEMINI_KEYS)
+            genai.configure(api_key=api_key)
             model = genai.GenerativeModel(engine)
-            prompt = """Retorne APENAS JSON: {"name": "Peça", "part_number": "COD", "possible_vehicles": ["Carro A"], "category": "Cat", "confidence": "Alta"}"""
+            
+            prompt = """
+            Você é um especialista em autopeças. Analise esta imagem técnica.
+            Retorne APENAS um JSON válido.
+            Estrutura: {"name": "Peça", "part_number": "COD", "possible_vehicles": ["Carro A"], "category": "Cat", "confidence": "Alta"}
+            """
+            
             response = model.generate_content([prompt, {"mime_type": file.content_type, "data": image_content}])
+            
             text = response.text
-            start, end = text.find('{'), text.rfind('}') + 1
-            if start != -1 and end != 0: return json.loads(text[start:end])
-        except: continue
-    raise HTTPException(500, "Falha na IA")
+            start = text.find('{')
+            end = text.rfind('}') + 1
+            if start != -1 and end != 0:
+                result_json = json.loads(text[start:end])
+                success = True
+                break
+        except Exception as e:
+            last_error = str(e)
+            continue 
+
+    if not success:
+        # Fallback de JSON vazio se falhar tudo
+        raise HTTPException(status_code=500, detail=f"Falha na IA: {last_error}")
+    
+    return result_json
 
 @app.post("/api/sales/checkout")
 def checkout(sale: SaleRequest):
     if parts_collection is None: raise HTTPException(503, "DB Offline")
-    db.vendas.insert_one(sale.dict())
-    for item in sale.items:
-        parts_collection.update_one(
-            {"_id": ObjectId(item.part_id), "ESTOQUE_REDE.loja_id": sale.store_id},
-            {"$inc": {"ESTOQUE_REDE.$.qtd": -item.quantity}}
-        )
-    return {"status": "success"}
+    try:
+        db.vendas.insert_one(sale.dict())
+        for item in sale.items:
+            parts_collection.update_one(
+                {"_id": ObjectId(item.part_id), "ESTOQUE_REDE.loja_id": sale.store_id},
+                {"$inc": {"ESTOQUE_REDE.$.qtd": -item.quantity}}
+            )
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Erro PDV: {e}")
+        raise HTTPException(500, "Erro ao processar venda")
 
-# --- NOVAS ROTAS DE LOGÍSTICA (WORKFLOW) ---
+# --- NOVAS ROTAS DE LOGÍSTICA ---
 
-# 1. CRIAR SOLICITAÇÃO
 @app.post("/api/logistics/request")
 def request_transfer(req: TransferRequest):
     if transfers_collection is None: raise HTTPException(503, "DB Offline")
     
-    # Busca nome da peça para facilitar exibição
     part = parts_collection.find_one({"_id": ObjectId(req.part_id)})
-    part_name = part.get("PRODUTO_NOME") if part else "Peça Desconhecida"
+    part_name = part.get("PRODUTO_NOME") if part else "Desconhecido"
     part_image = part.get("IMAGEM_URL") if part else ""
 
     doc = {
         "part_id": req.part_id,
         "part_name": part_name,
         "part_image": part_image,
-        "from_store_id": req.from_store_id, # Loja que vai CEDER a peça
-        "to_store_id": req.to_store_id,     # Loja que PEDIU (Destino)
+        "from_store_id": req.from_store_id,
+        "to_store_id": req.to_store_id,
         "quantity": req.quantity,
-        "type": req.type, # 'ENTREGA' ou 'RETIRADA'
-        "status": "PENDENTE", # PENDENTE, SEPARACAO, TRANSITO, CONCLUIDO, REJEITADO
+        "type": req.type,
+        "status": "PENDENTE",
         "created_at": datetime.now(),
-        "history": [{
-            "status": "PENDENTE", 
-            "user": req.user_id, 
-            "time": datetime.now()
-        }]
+        "history": [{"status": "PENDENTE", "user": req.user_id, "time": datetime.now()}]
     }
     transfers_collection.insert_one(doc)
-    return {"status": "success", "message": "Solicitação criada"}
+    return {"status": "success"}
 
-# 2. LISTAR SOLICITAÇÕES
 @app.get("/api/logistics/list")
 def list_transfers(store_id: int):
     if transfers_collection is None: return []
-    
-    # Busca pedidos onde a loja é Origem (para aprovar) OU Destino (para receber)
     cursor = transfers_collection.find({
-        "$or": [
-            {"from_store_id": int(store_id)},
-            {"to_store_id": int(store_id)}
-        ]
+        "$or": [{"from_store_id": int(store_id)}, {"to_store_id": int(store_id)}]
     }).sort("created_at", -1)
     
     results = []
@@ -217,7 +268,6 @@ def list_transfers(store_id: int):
         results.append(doc)
     return results
 
-# 3. ATUALIZAR STATUS (O CÉREBRO DO PROCESSO)
 @app.post("/api/logistics/update-status")
 def update_status(data: TransferStatusUpdate):
     if transfers_collection is None: raise HTTPException(503, "DB Offline")
@@ -225,68 +275,60 @@ def update_status(data: TransferStatusUpdate):
     transfer = transfers_collection.find_one({"_id": ObjectId(data.transfer_id)})
     if not transfer: raise HTTPException(404, "Pedido não encontrado")
     
-    current_status = transfer["status"]
     new_status = data.new_status
-    transfer_type = transfer["type"]
     qty = transfer["quantity"]
     from_id = transfer["from_store_id"]
     to_id = transfer["to_store_id"]
     part_oid = ObjectId(transfer["part_id"])
 
-    # Lógica de Movimentação de Estoque
     if new_status == "APROVADO": 
-        # Verifica saldo na origem
+        # Verifica Saldo
         part = parts_collection.find_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": from_id}, {"ESTOQUE_REDE.$": 1})
         if not part: raise HTTPException(400, "Origem sem estoque")
-        curr_qtd = part["ESTOQUE_REDE"][0].get("qtd", 0)
         
+        # Converte para int seguro
+        try:
+            curr_qtd = int(part["ESTOQUE_REDE"][0].get("qtd", 0))
+        except:
+            curr_qtd = 0
+
         if curr_qtd < qty: raise HTTPException(400, f"Saldo insuficiente. Disp: {curr_qtd}")
 
-        if transfer_type == "RETIRADA":
-            # RETIRADA: Movimenta imediatamente e finaliza
-            # 1. Tira da Origem
+        if transfer["type"] == "RETIRADA":
+            # Baixa Origem
             parts_collection.update_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": from_id}, {"$inc": {"ESTOQUE_REDE.$.qtd": -qty}})
-            # 2. Põe no Destino
+            # Credita Destino
             _credit_dest(part_oid, to_id, qty)
             new_status = "CONCLUIDO"
         else:
-            # ENTREGA: Tira da Origem (reserva) e vai para SEPARAÇÃO
+            # Baixa Origem (Reserva)
             parts_collection.update_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": from_id}, {"$inc": {"ESTOQUE_REDE.$.qtd": -qty}})
             new_status = "SEPARACAO"
-
-    elif new_status == "TRANSITO":
-        if current_status != "SEPARACAO": raise HTTPException(400, "Fluxo inválido")
-        # Apenas muda o status visual
     
-    elif new_status == "CONCLUIDO":
-        if transfer_type == "ENTREGA":
-            if current_status != "TRANSITO": raise HTTPException(400, "Precisa estar em trânsito para receber")
-            # Credita no Destino (só agora)
-            _credit_dest(part_oid, to_id, qty)
-        
-    elif new_status == "REJEITADO":
-        if current_status != "PENDENTE": raise HTTPException(400, "Não pode rejeitar se já iniciou")
-        # Não faz nada com estoque
+    elif new_status == "CONCLUIDO" and transfer["type"] == "ENTREGA":
+        _credit_dest(part_oid, to_id, qty)
 
-    # Atualiza documento
     transfers_collection.update_one(
         {"_id": ObjectId(data.transfer_id)},
-        {
-            "$set": {"status": new_status},
-            "$push": {"history": {"status": new_status, "user": data.user_id, "time": datetime.now()}}
-        }
+        {"$set": {"status": new_status}, "$push": {"history": {"status": new_status, "user": data.user_id}}}
     )
-    
-    return {"status": "success", "new_status": new_status}
+    return {"status": "success"}
 
 def _credit_dest(part_oid, store_id, qty):
-    # Função auxiliar para creditar estoque (cria loja se não existir)
     exists = parts_collection.find_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": store_id})
     if exists:
         parts_collection.update_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": store_id}, {"$inc": {"ESTOQUE_REDE.$.qtd": qty}})
     else:
         new_entry = {"loja_id": store_id, "nome": f"Loja {store_id}", "qtd": qty, "local": "Receb."}
         parts_collection.update_one({"_id": part_oid}, {"$push": {"ESTOQUE_REDE": new_entry}})
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if __name__ == "__main__":
     import uvicorn
