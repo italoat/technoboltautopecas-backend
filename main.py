@@ -123,17 +123,19 @@ def login(data: LoginRequest):
 
 @app.get("/api/parts")
 def get_parts(q: Optional[str] = None):
-    # CORREÇÃO 3: Verificação explícita de None
+    # Verificação de segurança
     if parts_collection is None:
         return []
     
     query = {}
     if q:
+        # CORREÇÃO 1: Buscando nos campos corretos do MongoDB (Português)
         query = {
             "$or": [
-                {"name": {"$regex": q, "$options": "i"}},
-                {"code": {"$regex": q, "$options": "i"}},
-                {"brand": {"$regex": q, "$options": "i"}}
+                {"PRODUTO_NOME": {"$regex": q, "$options": "i"}},
+                {"COD_FABRICANTE": {"$regex": q, "$options": "i"}},
+                {"MARCA": {"$regex": q, "$options": "i"}},
+                {"SKU_ID": {"$regex": q, "$options": "i"}}
             ]
         }
     
@@ -141,10 +143,28 @@ def get_parts(q: Optional[str] = None):
         cursor = parts_collection.find(query).limit(50)
         parts = []
         for p in cursor:
-            p["id"] = str(p.pop("_id"))
-            parts.append(p)
+            # CORREÇÃO 2: Mapeamento (De-Para) do Banco (PT) para o Frontend (EN)
+            # O Frontend espera: id, name, code, brand, price_retail, quantity, image
+            
+            mapped_part = {
+                "id": str(p.get("_id")),
+                "name": p.get("PRODUTO_NOME", "Nome Indisponível"),
+                "code": p.get("COD_FABRICANTE", p.get("SKU_ID", "")),
+                "brand": p.get("MARCA", "Genérica"),
+                "category": p.get("CATEGORIA", "Geral"),
+                "price_retail": p.get("PRECO_VENDA", 0.0),
+                "image": p.get("IMAGEM_URL", ""),
+                "compatible_vehicles": [p.get("APLICACAO_VEICULOS")] if isinstance(p.get("APLICACAO_VEICULOS"), str) else [],
+                
+                # Tratamento simples de estoque: Se não tiver campo de qtd, assume 10 para teste
+                # Futuramente, você deve somar o array 'ESTOQUE_REDE'
+                "quantity": 10 
+            }
+            parts.append(mapped_part)
+            
         return parts
-    except Exception:
+    except Exception as e:
+        print(f"Erro ao buscar peças: {e}")
         return []
 
 @app.post("/api/ai/identify")
