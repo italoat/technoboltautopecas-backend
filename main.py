@@ -2,7 +2,7 @@ import os
 import json
 import random
 import re
-from typing import List, Optional
+from typing import List, Optional, Union
 from urllib.parse import quote_plus
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -33,8 +33,7 @@ else:
 GEMINI_KEYS = [os.getenv(f"GEMINI_CHAVE_{i}") for i in range(1, 8)]
 VALID_GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 
-# SEUS MOTORES (Mantidos)
-# O sistema tentará o primeiro. Se falhar, tenta o próximo.
+# --- SEUS MOTORES (ORDEM DE PREFERÊNCIA) ---
 MY_ENGINES = [
     "models/gemini-3-flash-preview", 
     "models/gemini-2.5-flash", 
@@ -50,6 +49,7 @@ users_collection = None
 transfers_collection = None
 sales_collection = None
 messages_collection = None
+logs_collection = None # Adicionado para Auditoria
 db = None
 
 try:
@@ -59,7 +59,8 @@ try:
     users_collection = db.usuarios
     transfers_collection = db.transferencias
     sales_collection = db.vendas
-    messages_collection = db.mensagens # Chat
+    messages_collection = db.mensagens
+    logs_collection = db.logs_estoque # Inicialização da coleção de logs
     
     client.admin.command('ping')
     db_status = "Conectado e Operacional"
@@ -91,12 +92,12 @@ class SaleCreateRequest(BaseModel):
 class SaleFinalizeRequest(BaseModel):
     sale_id: str
     payment_method: str
-
+    
 class FiscalUpdate(BaseModel):
     part_id: str
     ncm: str
     cst: str
-
+    
 class TransferRequest(BaseModel):
     part_id: str
     from_store_id: int
@@ -118,6 +119,30 @@ class ChatMessage(BaseModel):
 
 class AIChatRequest(BaseModel):
     prompt: str
+
+# Novo: Modelo para Cadastro de Produtos
+class ProductCreate(BaseModel):
+    SKU_ID: str
+    PRODUTO_NOME: str
+    MARCA: str
+    COD_FABRICANTE: str
+    COD_EQUIVALENTES: List[str] = []
+    EAN_BARRAS: str = ""
+    APLICACAO_VEICULOS: str = ""
+    CATEGORIA: str = "Geral"
+    NCM: str = ""
+    PRECO_CUSTO: float = 0.0
+    PRECO_VENDA: float = 0.0
+    TAGS_IA: str = ""
+
+# Novo: Modelo para Ajuste de Estoque (Auditoria)
+class InventoryAdjustment(BaseModel):
+    part_id: str
+    store_id: int
+    user_name: str
+    old_quantity: int
+    new_quantity: int
+    reason: str
 
 # --- ROTAS GERAIS ---
 
@@ -146,6 +171,8 @@ def login(data: LoginRequest):
         "token": "bolt_session_active",
         "currentStore": {"id": user.get("allowed_stores", [1])[0], "name": "Loja Padrão"}
     }
+
+# --- PRODUTOS E ESTOQUE ---
 
 @app.get("/api/parts")
 def get_parts(q: Optional[str] = None):
@@ -186,11 +213,11 @@ def get_parts(q: Optional[str] = None):
                 "image": p.get("IMAGEM_URL", ""),
                 "price": p.get("PRECO_VENDA", 0.0),
                 "price_retail": p.get("PRECO_VENDA", 0.0),
-                "ncm": p.get("NCM", ""), # Adicionado para Fiscal
-                "cst": p.get("CST", "0"), # Adicionado para Fiscal
                 "quantity": total_qtd,      
                 "total_stock": total_qtd,   
                 "stock_locations": estoque_rede,
+                "ncm": p.get("NCM", ""),
+                "cst": p.get("CST", "0"),
                 "application": p.get("APLICACAO_VEICULOS", "Aplicação não informada"),
                 "category": p.get("CATEGORIA", "Geral")
             })
@@ -198,6 +225,75 @@ def get_parts(q: Optional[str] = None):
     except Exception as e:
         print(f"Erro busca: {e}")
         return []
+
+@app.post("/api/products")
+def create_products(data: Union[ProductCreate, List[ProductCreate]]):
+    if parts_collection is None: raise HTTPException(503, "DB Offline")
+    
+    # Normaliza para lista
+    items = data if isinstance(data, list) else [data]
+    inserted_ids = []
+
+    for item in items:
+        # Verifica duplicidade
+        if parts_collection.find_one({"SKU_ID": item.SKU_ID}):
+            continue 
+
+        doc = item.dict()
+        doc["ESTOQUE_REDE"] = [
+            {"loja_id": 1, "nome": "Loja 01 - Matriz", "qtd": 0, "local": "Recebimento"}
+        ]
+        doc["IMAGEM_URL"] = ""
+        
+        res = parts_collection.insert_one(doc)
+        inserted_ids.append(str(res.inserted_id))
+
+    return {"status": "success", "count": len(inserted_ids), "ids": inserted_ids}
+
+# --- AUDITORIA DE ESTOQUE ---
+
+@app.post("/api/inventory/adjust")
+def adjust_inventory(data: InventoryAdjustment):
+    if parts_collection is None: raise HTTPException(503, "DB Offline")
+    
+    # 1. Atualiza Estoque Físico
+    part_oid = ObjectId(data.part_id)
+    
+    # Verifica se a loja existe no array
+    part = parts_collection.find_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": data.store_id})
+
+    if part:
+        parts_collection.update_one(
+            {"_id": part_oid, "ESTOQUE_REDE.loja_id": data.store_id},
+            {"$set": {"ESTOQUE_REDE.$.qtd": data.new_quantity}}
+        )
+    else:
+        parts_collection.update_one(
+            {"_id": part_oid},
+            {"$push": {"ESTOQUE_REDE": {"loja_id": data.store_id, "nome": f"Loja {data.store_id}", "qtd": data.new_quantity, "local": "Auditado"}}}
+        )
+
+    # 2. Salva Log
+    log_entry = data.dict()
+    log_entry["created_at"] = datetime.now()
+    prod = parts_collection.find_one({"_id": part_oid}, {"PRODUTO_NOME": 1})
+    log_entry["product_name"] = prod.get("PRODUTO_NOME", "Desconhecido") if prod else "Desconhecido"
+    
+    if logs_collection is not None:
+        logs_collection.insert_one(log_entry)
+    
+    return {"status": "success"}
+
+@app.get("/api/inventory/logs")
+def get_inventory_logs(store_id: int):
+    if logs_collection is None: return []
+    cursor = logs_collection.find({"store_id": store_id}).sort("created_at", -1).limit(100)
+    logs = []
+    for log in cursor:
+        log["id"] = str(log["_id"])
+        del log["_id"]
+        logs.append(log)
+    return logs
 
 # --- VISION AI (IDENTIFICADOR COM SEUS MOTORES) ---
 @app.post("/api/ai/identify")
@@ -210,6 +306,7 @@ async def identify_part(file: UploadFile = File(...)):
     success = False
     result_json = {}
 
+    # Itera sobre seus motores até um funcionar
     for engine in MY_ENGINES:
         try:
             print(f"Tentando motor Vision: {engine}...")
@@ -243,7 +340,6 @@ async def identify_part(file: UploadFile = File(...)):
     
     return result_json
 
-# --- FISCAL ---
 @app.post("/api/fiscal/update")
 def update_fiscal(data: FiscalUpdate):
     if parts_collection is None: raise HTTPException(503, "DB Offline")
