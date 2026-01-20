@@ -48,6 +48,7 @@ parts_collection = None
 users_collection = None
 transfers_collection = None
 sales_collection = None
+messages_collection = None # Nova coleção para Chat
 db = None
 
 try:
@@ -57,6 +58,7 @@ try:
     users_collection = db.usuarios
     transfers_collection = db.transferencias
     sales_collection = db.vendas
+    messages_collection = db.mensagens # Chat
     
     client.admin.command('ping')
     db_status = "Conectado e Operacional"
@@ -72,7 +74,7 @@ class LoginRequest(BaseModel):
 
 class SaleItem(BaseModel):
     part_id: str
-    name: str # Adicionado para visualização
+    name: str 
     quantity: int
     unit_price: float
 
@@ -101,6 +103,15 @@ class TransferStatusUpdate(BaseModel):
     transfer_id: str
     new_status: str # APROVADO, REJEITADO, TRANSITO, CONCLUIDO
     user_id: str
+
+# Novos Modelos
+class ChatMessage(BaseModel):
+    user: str
+    text: str
+    timestamp: str
+
+class AIChatRequest(BaseModel):
+    prompt: str
 
 # --- ROTAS GERAIS ---
 
@@ -182,6 +193,7 @@ def get_parts(q: Optional[str] = None):
         print(f"Erro busca: {e}")
         return []
 
+# --- VISION AI ---
 @app.post("/api/ai/identify")
 async def identify_part(file: UploadFile = File(...)):
     if not VALID_GEMINI_KEYS:
@@ -223,6 +235,82 @@ async def identify_part(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Falha na IA: {last_error}")
     
     return result_json
+
+# --- CONSULTOR IA (TEXTO) ---
+@app.post("/api/ai/consult")
+def ai_consult(req: AIChatRequest):
+    if not VALID_GEMINI_KEYS:
+        raise HTTPException(status_code=500, detail="Sem chaves configuradas")
+    
+    try:
+        api_key = random.choice(VALID_GEMINI_KEYS)
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        sys_prompt = """
+        Você é o Consultor Técnico da TechnoBolt. 
+        Responda de forma concisa, técnica e útil para vendedores de autopeças.
+        Foque em especificações, compatibilidade e dicas de manutenção.
+        """
+        
+        full_prompt = f"{sys_prompt}\n\nPergunta do usuário: {req.prompt}"
+        response = model.generate_content(full_prompt)
+        
+        return {"response": response.text}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- CRM (AGREGAÇÃO DE VENDAS) ---
+@app.get("/api/crm/clients")
+def get_crm_clients():
+    if sales_collection is None: return []
+    
+    # Agrega vendas por nome de cliente para criar perfil
+    pipeline = [
+        {"$match": {"client_name": {"$ne": "Consumidor Final"}}}, # Ignora anônimos
+        {"$group": {
+            "_id": "$client_name",
+            "total_spent": {"$sum": "$total"},
+            "last_purchase": {"$max": "$created_at"},
+            "purchase_count": {"$sum": 1}
+        }},
+        {"$sort": {"last_purchase": -1}},
+        {"$limit": 50}
+    ]
+    
+    try:
+        results = list(sales_collection.aggregate(pipeline))
+        # Formata para o frontend
+        clients = []
+        for r in results:
+            clients.append({
+                "name": r["_id"],
+                "total_spent": r["total_spent"],
+                "last_purchase": r["last_purchase"],
+                "count": r["purchase_count"]
+            })
+        return clients
+    except Exception as e:
+        print(f"Erro CRM: {e}")
+        return []
+
+# --- CHAT DA EQUIPE ---
+@app.get("/api/chat/messages")
+def get_chat_messages():
+    if messages_collection is None: return []
+    # Pega as últimas 50 mensagens
+    cursor = messages_collection.find().sort("timestamp", -1).limit(50)
+    msgs = list(cursor)
+    msgs.reverse() # Inverte para mostrar as mais antigas no topo
+    
+    return [{"id": str(m["_id"]), "user": m["user"], "text": m["text"], "timestamp": m["timestamp"]} for m in msgs]
+
+@app.post("/api/chat/messages")
+def post_chat_message(msg: ChatMessage):
+    if messages_collection is None: raise HTTPException(503, "DB Offline")
+    
+    messages_collection.insert_one(msg.dict())
+    return {"status": "sent"}
 
 # --- ROTAS DE VENDAS (PDV -> CAIXA) ---
 
