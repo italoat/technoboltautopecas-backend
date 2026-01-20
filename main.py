@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import google.generativeai as genai
 from pymongo import MongoClient
-from pymongo.errors import OperationFailure
 from bson.objectid import ObjectId
 from dotenv import load_dotenv
 
@@ -31,6 +30,16 @@ else:
 # Configuração das chaves Gemini
 GEMINI_KEYS = [os.getenv(f"GEMINI_CHAVE_{i}") for i in range(1, 8)]
 VALID_GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
+
+# --- SEUS MOTORES DE PREFERÊNCIA ---
+# O sistema tentará usar estes modelos na ordem, até um funcionar.
+MY_ENGINES = [
+    "models/gemini-3-flash-preview", 
+    "models/gemini-2.5-flash", 
+    "models/gemini-2.0-flash", 
+    "models/gemini-flash-latest",
+    "gemini-1.5-flash" # Fallback de segurança garantido
+]
 
 # --- INICIALIZAÇÃO DO BANCO DE DADOS ---
 db_status = "Desconectado"
@@ -120,9 +129,10 @@ def get_parts(q: Optional[str] = None):
         cursor = parts_collection.find(query).limit(50)
         parts = []
         for p in cursor:
-            # Cálculo de Estoque Total
+            # Soma do Estoque da Rede
             estoque_rede = p.get("ESTOQUE_REDE", [])
             total_qtd = 0
+            
             if isinstance(estoque_rede, list):
                 for loja in estoque_rede:
                     qtd = loja.get("qtd", 0)
@@ -154,43 +164,62 @@ async def identify_part(file: UploadFile = File(...)):
         print("❌ Erro: Nenhuma chave Gemini configurada.")
         raise HTTPException(status_code=500, detail="Serviço de IA não configurado no servidor.")
     
-    try:
-        # 1. Configura a chave
-        api_key = random.choice(VALID_GEMINI_KEYS)
-        genai.configure(api_key=api_key)
-        
-        # 2. Prepara o Modelo
-        model = genai.GenerativeModel("models/gemini-3-flash-preview", "models/gemini-2.5-flash", "models/gemini-2.0-flash", "models/gemini-flash-latest")
-        image_content = await file.read()
-        
-        # 3. Prompt Refinado
-        prompt = """
-        Atue como um especialista em autopeças. Analise a imagem técnica.
-        Retorne APENAS um JSON válido (sem markdown, sem crases) com este formato:
-        {
-            "name": "Nome técnico curto da peça",
-            "part_number": "Código se visível ou vazio",
-            "possible_vehicles": ["Lista de 2 ou 3 carros compatíveis"],
-            "category": "Categoria da peça",
-            "confidence": "Alta"
-        }
-        """
-        
-        # 4. Chama a IA
-        response = model.generate_content([
-            prompt,
-            {"mime_type": file.content_type, "data": image_content}
-        ])
-        
-        # 5. Limpeza da Resposta (Crucial para evitar erros de JSON)
-        clean_text = response.text.replace("```json", "").replace("```", "").strip()
-        
-        return json.loads(clean_text)
+    last_error = ""
+    image_content = await file.read()
+    
+    # --- SISTEMA DE MOTORES (Tenta um por um até funcionar) ---
+    success = False
+    result_json = {}
 
-    except Exception as e:
-        print(f"❌ Erro Crítico na IA: {e}")
-        # Retorna um erro 500 detalhado para o frontend entender
-        raise HTTPException(status_code=500, detail=f"Erro ao processar imagem: {str(e)}")
+    for engine in MY_ENGINES:
+        try:
+            # Configura chave (Rodízio)
+            api_key = random.choice(VALID_GEMINI_KEYS)
+            genai.configure(api_key=api_key)
+            
+            # Inicializa SEU MOTOR ESPECÍFICO
+            print(f"🔄 Tentando motor: {engine}...")
+            model = genai.GenerativeModel(engine)
+            
+            prompt = """
+            Você é um especialista em autopeças. Analise esta imagem técnica.
+            Retorne APENAS um JSON válido.
+            Estrutura:
+            {
+                "name": "Nome técnico curto da peça",
+                "part_number": "Código se visível ou vazio",
+                "possible_vehicles": ["Lista de 2 ou 3 carros compatíveis"],
+                "category": "Categoria da peça",
+                "confidence": "Alta"
+            }
+            """
+            
+            response = model.generate_content([
+                prompt,
+                {"mime_type": file.content_type, "data": image_content}
+            ])
+            
+            # Limpeza de Resposta
+            text = response.text
+            start = text.find('{')
+            end = text.rfind('}') + 1
+            
+            if start != -1 and end != 0:
+                json_str = text[start:end]
+                result_json = json.loads(json_str)
+                success = True
+                print(f"✅ Sucesso com motor: {engine}")
+                break # Sai do loop se funcionou
+            
+        except Exception as e:
+            print(f"⚠️ Falha no motor {engine}: {e}")
+            last_error = str(e)
+            continue # Tenta o próximo motor da lista
+
+    if not success:
+        raise HTTPException(status_code=500, detail=f"Todos os motores falharam. Último erro: {last_error}")
+    
+    return result_json
 
 @app.post("/api/sales/checkout")
 def checkout(sale: SaleRequest):
@@ -199,6 +228,7 @@ def checkout(sale: SaleRequest):
     try:
         db.vendas.insert_one(sale.dict())
         for item in sale.items:
+            # Atualiza apenas a loja específica
             parts_collection.update_one(
                 {"_id": ObjectId(item.part_id), "ESTOQUE_REDE.loja_id": sale.store_id},
                 {"$inc": {"ESTOQUE_REDE.$.qtd": -item.quantity}}
@@ -215,7 +245,7 @@ def transfer_stock(req: TransferRequest):
     try:
         part_oid = ObjectId(req.part_id)
         
-        # Verifica Origem
+        # 1. Verifica Origem
         part = parts_collection.find_one(
             {"_id": part_oid, "ESTOQUE_REDE.loja_id": req.from_store_id},
             {"ESTOQUE_REDE.$": 1}
@@ -226,13 +256,13 @@ def transfer_stock(req: TransferRequest):
         if curr_qtd < req.quantity:
             raise HTTPException(400, f"Saldo insuficiente. Disponível: {curr_qtd}")
 
-        # Debita Origem
+        # 2. Debita Origem
         parts_collection.update_one(
             {"_id": part_oid, "ESTOQUE_REDE.loja_id": req.from_store_id},
             {"$inc": {"ESTOQUE_REDE.$.qtd": -req.quantity}}
         )
 
-        # Credita Destino
+        # 3. Credita Destino
         dest_exists = parts_collection.find_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": req.to_store_id})
         if dest_exists:
             parts_collection.update_one(
@@ -240,7 +270,7 @@ def transfer_stock(req: TransferRequest):
                 {"$inc": {"ESTOQUE_REDE.$.qtd": req.quantity}}
             )
         else:
-            # Cria entrada na loja destino se não existir
+            # Cria entrada na loja destino
             new_entry = {"loja_id": req.to_store_id, "nome": f"Loja {req.to_store_id}", "qtd": req.quantity, "local": "Recebimento"}
             parts_collection.update_one({"_id": part_oid}, {"$push": {"ESTOQUE_REDE": new_entry}})
 
