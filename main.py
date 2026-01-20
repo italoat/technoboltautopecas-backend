@@ -107,6 +107,7 @@ class TransferStatusUpdate(BaseModel):
 
 class ChatMessage(BaseModel):
     user: str
+    to: str = "Todos" # Campo novo
     text: str
     timestamp: str
 
