@@ -33,8 +33,8 @@ else:
 GEMINI_KEYS = [os.getenv(f"GEMINI_CHAVE_{i}") for i in range(1, 8)]
 VALID_GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
 
-# --- SEUS MOTORES (ORDEM DE PREFERÊNCIA) ---
-# O sistema tentará o primeiro. Se falhar, tenta o próximo automaticamente.
+# SEUS MOTORES (Mantidos)
+# O sistema tentará o primeiro. Se falhar, tenta o próximo.
 MY_ENGINES = [
     "models/gemini-3-flash-preview", 
     "models/gemini-2.5-flash", 
@@ -59,7 +59,7 @@ try:
     users_collection = db.usuarios
     transfers_collection = db.transferencias
     sales_collection = db.vendas
-    messages_collection = db.mensagens
+    messages_collection = db.mensagens # Chat
     
     client.admin.command('ping')
     db_status = "Conectado e Operacional"
@@ -91,12 +91,12 @@ class SaleCreateRequest(BaseModel):
 class SaleFinalizeRequest(BaseModel):
     sale_id: str
     payment_method: str
-    
+
 class FiscalUpdate(BaseModel):
     part_id: str
     ncm: str
     cst: str
-    
+
 class TransferRequest(BaseModel):
     part_id: str
     from_store_id: int
@@ -112,7 +112,7 @@ class TransferStatusUpdate(BaseModel):
 
 class ChatMessage(BaseModel):
     user: str
-    to: str = "Todos" # Campo novo
+    to: str = "Todos"
     text: str
     timestamp: str
 
@@ -146,8 +146,6 @@ def login(data: LoginRequest):
         "token": "bolt_session_active",
         "currentStore": {"id": user.get("allowed_stores", [1])[0], "name": "Loja Padrão"}
     }
-
-
 
 @app.get("/api/parts")
 def get_parts(q: Optional[str] = None):
@@ -188,6 +186,8 @@ def get_parts(q: Optional[str] = None):
                 "image": p.get("IMAGEM_URL", ""),
                 "price": p.get("PRECO_VENDA", 0.0),
                 "price_retail": p.get("PRECO_VENDA", 0.0),
+                "ncm": p.get("NCM", ""), # Adicionado para Fiscal
+                "cst": p.get("CST", "0"), # Adicionado para Fiscal
                 "quantity": total_qtd,      
                 "total_stock": total_qtd,   
                 "stock_locations": estoque_rede,
@@ -210,7 +210,6 @@ async def identify_part(file: UploadFile = File(...)):
     success = False
     result_json = {}
 
-    # Itera sobre seus motores até um funcionar
     for engine in MY_ENGINES:
         try:
             print(f"Tentando motor Vision: {engine}...")
@@ -244,18 +243,14 @@ async def identify_part(file: UploadFile = File(...)):
     
     return result_json
 
+# --- FISCAL ---
 @app.post("/api/fiscal/update")
 def update_fiscal(data: FiscalUpdate):
     if parts_collection is None: raise HTTPException(503, "DB Offline")
     
-    # Atualiza o NCM e CST no banco
     result = parts_collection.update_one(
         {"_id": ObjectId(data.part_id)},
-        {"$set": {
-            "NCM": data.ncm,
-            "CST": data.cst,
-            # Se tiver NCM, remove flag de erro (opcional, depende da sua lógica)
-        }}
+        {"$set": {"NCM": data.ncm, "CST": data.cst}}
     )
     
     if result.modified_count == 0:
@@ -277,10 +272,10 @@ def ai_consult(req: AIChatRequest):
     Você é o Consultor Técnico da TechnoBolt. 
     Responda de forma concisa, técnica e útil para vendedores de autopeças.
     Foque em especificações, compatibilidade e dicas de manutenção.
+    Se o usuário pedir para escrever um email ou mensagem, atenda ao pedido com linguagem natural.
     """
     full_prompt = f"{sys_prompt}\n\nPergunta do usuário: {req.prompt}"
 
-    # Itera sobre seus motores até um funcionar
     for engine in MY_ENGINES:
         try:
             print(f"Tentando motor Chat: {engine}...")
@@ -299,7 +294,6 @@ def ai_consult(req: AIChatRequest):
             continue 
 
     if not success:
-        # Retorna 500 apenas se TODOS falharem
         raise HTTPException(status_code=500, detail=f"IA Indisponível (Todos os motores falharam): {last_error}")
 
     return {"response": response_text}
@@ -343,7 +337,7 @@ def get_chat_messages():
     cursor = messages_collection.find().sort("timestamp", -1).limit(50)
     msgs = list(cursor)
     msgs.reverse()
-    return [{"id": str(m["_id"]), "user": m["user"], "text": m["text"], "timestamp": m["timestamp"]} for m in msgs]
+    return [{"id": str(m["_id"]), "user": m["user"], "to": m.get("to", "Todos"), "text": m["text"], "timestamp": m["timestamp"]} for m in msgs]
 
 @app.post("/api/chat/messages")
 def post_chat_message(msg: ChatMessage):
