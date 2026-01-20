@@ -19,13 +19,10 @@ app = FastAPI(title="TechnoBolt Enterprise API")
 
 # --- CONFIGURAÇÕES DE AMBIENTE ---
 PORT = int(os.environ.get("PORT", 10000))
-
-# Tratamento seguro da String de Conexão MongoDB
 mongo_user = quote_plus(os.getenv('MONGO_USER', ''))
 mongo_pass = quote_plus(os.getenv('MONGO_PASS', ''))
 mongo_host = os.getenv('MONGO_HOST', '')
 
-# Construção da URI
 if not mongo_host:
     MONGO_URI = "mongodb://localhost:27017"
 else:
@@ -46,50 +43,14 @@ try:
     db = client.technoboltauto        
     parts_collection = db.estoque     
     users_collection = db.usuarios    
-    
-    # Teste de conexão
     client.admin.command('ping')
     db_status = "Conectado e Operacional"
     print("✅ MongoDB Atlas: Conexão estabelecida com sucesso!")
-except OperationFailure:
-    db_status = "Erro de Permissão (Verifique o Atlas)"
-    print("❌ Erro: Usuário sem permissão no banco 'technoboltauto'")
 except Exception as e:
     db_status = f"Erro de Conexão: {str(e)}"
     print(f"❌ Falha ao conectar no MongoDB: {e}")
 
-# --- SEED DE DADOS (POPULAÇÃO INICIAL) ---
-def seed_data():
-    if parts_collection is None: 
-        return
-        
-    try:
-        # Só popula se a coleção estiver vazia
-        if parts_collection.count_documents({}) == 0:
-            file_path = "dataset_enterprise.json"
-            if os.path.exists(file_path):
-                with open(file_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    items = data.get("parts", []) if isinstance(data, dict) else data
-                    if items:
-                        parts_collection.insert_many(items)
-                        print(f"✅ Seed: {len(items)} peças importadas do JSON.")
-    except Exception as e:
-        print(f"⚠️ Erro no processo de Seed: {e}")
-
-# Executa o seed ao subir o serviço
-seed_data()
-
-# --- MIDDLEWARE (CORS) ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- MODELOS DE DADOS ---
+# --- MODELS (PYDANTIC) ---
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -100,12 +61,19 @@ class SaleItem(BaseModel):
     unit_price: float
 
 class SaleRequest(BaseModel):
-    store_id: int       # ID da loja que está vendendo
+    store_id: int
     items: List[SaleItem]
-    payment_method: str # "pix", "credit", "cash"
+    payment_method: str
     total: float
 
-# --- ROTAS DA API ---
+class TransferRequest(BaseModel):
+    part_id: str
+    from_store_id: int
+    to_store_id: int
+    quantity: int
+    user_id: str
+
+# --- ROTAS ---
 
 @app.get("/")
 def health_check():
@@ -134,138 +102,161 @@ def login(data: LoginRequest):
 
 @app.get("/api/parts")
 def get_parts(q: Optional[str] = None):
-    # Verifica conexão com o banco
-    if parts_collection is None:
-        return []
+    if parts_collection is None: return []
     
     query = {}
     if q:
-        # Busca aprimorada: Nome, Código, Marca ou Códigos Equivalentes (Array)
         query = {
             "$or": [
                 {"PRODUTO_NOME": {"$regex": q, "$options": "i"}},
                 {"COD_FABRICANTE": {"$regex": q, "$options": "i"}},
                 {"SKU_ID": {"$regex": q, "$options": "i"}},
                 {"MARCA": {"$regex": q, "$options": "i"}},
-                {"COD_EQUIVALENTES": {"$regex": q, "$options": "i"}} 
+                {"COD_EQUIVALENTES": {"$regex": q, "$options": "i"}}
             ]
         }
     
     try:
-        # Busca no Mongo
         cursor = parts_collection.find(query).limit(50)
         parts = []
-        
         for p in cursor:
-            # 1. CÁLCULO DE ESTOQUE TOTAL (Soma as quantidades de todas as lojas)
+            # Cálculo de Estoque Total
             estoque_rede = p.get("ESTOQUE_REDE", [])
             total_qtd = 0
-            
             if isinstance(estoque_rede, list):
                 for loja in estoque_rede:
-                    # Garante que pega o número, mesmo se vier como string
                     qtd = loja.get("qtd", 0)
                     if isinstance(qtd, (int, float)):
                         total_qtd += int(qtd)
             
-            # 2. MAPEAMENTO (TRADUÇÃO) BANCO -> FRONTEND
-            mapped_part = {
+            parts.append({
                 "id": str(p.get("_id")),
                 "name": p.get("PRODUTO_NOME", "Nome Indisponível"),
                 "code": p.get("COD_FABRICANTE", p.get("SKU_ID", "")),
                 "brand": p.get("MARCA", "Genérica"),
                 "image": p.get("IMAGEM_URL", ""),
-                
-                # Campos de Preço (Enviando 'price' para compatibilidade com componentes legados)
-                "price": p.get("PRECO_VENDA", 0.0),       
-                "price_retail": p.get("PRECO_VENDA", 0.0), 
-                
-                # Campos de Estoque
-                "quantity": total_qtd,      # <--- Soma total para listagens Desktop
-                "total_stock": total_qtd,   # <--- Soma total para Vision/Mobile
-                "stock_locations": estoque_rede, # Detalhe por loja
-                
-                # Dados Extras
+                "price": p.get("PRECO_VENDA", 0.0),
+                "price_retail": p.get("PRECO_VENDA", 0.0),
+                "quantity": total_qtd,
+                "total_stock": total_qtd,
+                "stock_locations": estoque_rede,
                 "application": p.get("APLICACAO_VEICULOS", "Aplicação não informada"),
                 "category": p.get("CATEGORIA", "Geral")
-            }
-            parts.append(mapped_part)
-            
+            })
         return parts
-        
     except Exception as e:
-        print(f"❌ Erro ao buscar peças: {e}")
+        print(f"Erro busca: {e}")
         return []
-
-@app.post("/api/sales/checkout")
-def checkout(sale: SaleRequest):
-    if parts_collection is None:
-        raise HTTPException(status_code=503, detail="Banco de dados offline")
-        
-    try:
-        # 1. Registrar a Venda (Histórico)
-        sale_doc = sale.dict()
-        if db is not None:
-            # Se a coleção vendas não existir, o Mongo cria automaticamente
-            db.vendas.insert_one(sale_doc)
-        
-        # 2. Baixar Estoque (Atualizar ESTOQUE_REDE)
-        # Atualiza apenas a quantidade da loja específica onde a venda ocorreu
-        for item in sale.items:
-            parts_collection.update_one(
-                {
-                    "_id": ObjectId(item.part_id),
-                    "ESTOQUE_REDE.loja_id": sale.store_id
-                },
-                {
-                    "$inc": { "ESTOQUE_REDE.$.qtd": -item.quantity }
-                }
-            )
-            
-        return {"status": "success", "message": "Venda realizada e estoque atualizado"}
-        
-    except Exception as e:
-        print(f"Erro no checkout: {e}")
-        raise HTTPException(status_code=500, detail="Erro ao processar venda")
 
 @app.post("/api/ai/identify")
 async def identify_part(file: UploadFile = File(...)):
     if not VALID_GEMINI_KEYS:
-        raise HTTPException(status_code=500, detail="Configuração de IA ausente")
+        print("❌ Erro: Nenhuma chave Gemini configurada.")
+        raise HTTPException(status_code=500, detail="Serviço de IA não configurado no servidor.")
     
     try:
+        # 1. Configura a chave
         api_key = random.choice(VALID_GEMINI_KEYS)
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash')
         
+        # 2. Prepara o Modelo
+        model = genai.GenerativeModel("models/gemini-3-flash-preview", "models/gemini-2.5-flash", "models/gemini-2.0-flash", "models/gemini-flash-latest")
         image_content = await file.read()
         
+        # 3. Prompt Refinado
         prompt = """
-        Você é um especialista em catálogo de autopeças. 
-        Analise a imagem e identifique o item.
-        Retorne OBRIGATORIAMENTE apenas um JSON puro:
+        Atue como um especialista em autopeças. Analise a imagem técnica.
+        Retorne APENAS um JSON válido (sem markdown, sem crases) com este formato:
         {
-            "name": "Nome técnico da peça",
-            "part_number": "Código aproximado se visível",
-            "possible_vehicles": ["Veículo A", "Veículo B"],
-            "category": "Categoria da Peça",
-            "confidence": "Alta/Média/Baixa"
+            "name": "Nome técnico curto da peça",
+            "part_number": "Código se visível ou vazio",
+            "possible_vehicles": ["Lista de 2 ou 3 carros compatíveis"],
+            "category": "Categoria da peça",
+            "confidence": "Alta"
         }
         """
         
+        # 4. Chama a IA
         response = model.generate_content([
             prompt,
             {"mime_type": file.content_type, "data": image_content}
         ])
         
-        clean_json = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_json)
+        # 5. Limpeza da Resposta (Crucial para evitar erros de JSON)
+        clean_text = response.text.replace("```json", "").replace("```", "").strip()
         
+        return json.loads(clean_text)
+
     except Exception as e:
-        print(f"❌ Erro na IA: {e}")
-        raise HTTPException(status_code=500, detail="Falha ao processar imagem")
+        print(f"❌ Erro Crítico na IA: {e}")
+        # Retorna um erro 500 detalhado para o frontend entender
+        raise HTTPException(status_code=500, detail=f"Erro ao processar imagem: {str(e)}")
+
+@app.post("/api/sales/checkout")
+def checkout(sale: SaleRequest):
+    if parts_collection is None:
+        raise HTTPException(status_code=503, detail="Banco offline")
+    try:
+        db.vendas.insert_one(sale.dict())
+        for item in sale.items:
+            parts_collection.update_one(
+                {"_id": ObjectId(item.part_id), "ESTOQUE_REDE.loja_id": sale.store_id},
+                {"$inc": {"ESTOQUE_REDE.$.qtd": -item.quantity}}
+            )
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Erro PDV: {e}")
+        raise HTTPException(status_code=500, detail="Erro ao processar venda")
+
+@app.post("/api/logistics/transfer")
+def transfer_stock(req: TransferRequest):
+    if parts_collection is None:
+        raise HTTPException(status_code=503, detail="Banco offline")
+    try:
+        part_oid = ObjectId(req.part_id)
+        
+        # Verifica Origem
+        part = parts_collection.find_one(
+            {"_id": part_oid, "ESTOQUE_REDE.loja_id": req.from_store_id},
+            {"ESTOQUE_REDE.$": 1}
+        )
+        if not part: raise HTTPException(400, "Origem sem registro deste produto")
+        
+        curr_qtd = part["ESTOQUE_REDE"][0].get("qtd", 0)
+        if curr_qtd < req.quantity:
+            raise HTTPException(400, f"Saldo insuficiente. Disponível: {curr_qtd}")
+
+        # Debita Origem
+        parts_collection.update_one(
+            {"_id": part_oid, "ESTOQUE_REDE.loja_id": req.from_store_id},
+            {"$inc": {"ESTOQUE_REDE.$.qtd": -req.quantity}}
+        )
+
+        # Credita Destino
+        dest_exists = parts_collection.find_one({"_id": part_oid, "ESTOQUE_REDE.loja_id": req.to_store_id})
+        if dest_exists:
+            parts_collection.update_one(
+                {"_id": part_oid, "ESTOQUE_REDE.loja_id": req.to_store_id},
+                {"$inc": {"ESTOQUE_REDE.$.qtd": req.quantity}}
+            )
+        else:
+            # Cria entrada na loja destino se não existir
+            new_entry = {"loja_id": req.to_store_id, "nome": f"Loja {req.to_store_id}", "qtd": req.quantity, "local": "Recebimento"}
+            parts_collection.update_one({"_id": part_oid}, {"$push": {"ESTOQUE_REDE": new_entry}})
+
+        return {"status": "success"}
+    except Exception as e:
+        print(f"Erro Transferência: {e}")
+        raise HTTPException(500, str(e))
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if __name__ == "__main__":
     import uvicorn
-    # A porta precisa ser 0.0.0.0 para o Render acessá-la externamente
     uvicorn.run(app, host="0.0.0.0", port=PORT)
