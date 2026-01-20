@@ -123,48 +123,67 @@ def login(data: LoginRequest):
 
 @app.get("/api/parts")
 def get_parts(q: Optional[str] = None):
-    # Verificação de segurança
+    # Verifica conexão com o banco
     if parts_collection is None:
         return []
     
     query = {}
     if q:
-        # CORREÇÃO 1: Buscando nos campos corretos do MongoDB (Português)
+        # Busca aprimorada: Nome, Código, Marca ou Códigos Equivalentes (Array)
         query = {
             "$or": [
                 {"PRODUTO_NOME": {"$regex": q, "$options": "i"}},
                 {"COD_FABRICANTE": {"$regex": q, "$options": "i"}},
+                {"SKU_ID": {"$regex": q, "$options": "i"}},
                 {"MARCA": {"$regex": q, "$options": "i"}},
-                {"SKU_ID": {"$regex": q, "$options": "i"}}
+                {"COD_EQUIVALENTES": {"$regex": q, "$options": "i"}} # Busca dentro da lista de similares
             ]
         }
     
     try:
+        # Busca no Mongo
         cursor = parts_collection.find(query).limit(50)
         parts = []
+        
         for p in cursor:
-            # CORREÇÃO 2: Mapeamento (De-Para) do Banco (PT) para o Frontend (EN)
-            # O Frontend espera: id, name, code, brand, price_retail, quantity, image
+            # 1. CÁLCULO DE ESTOQUE TOTAL (Soma as quantidades de todas as lojas)
+            estoque_rede = p.get("ESTOQUE_REDE", [])
+            total_qtd = 0
             
+            if isinstance(estoque_rede, list):
+                for loja in estoque_rede:
+                    # Garante que pega o número, mesmo se vier como string
+                    qtd = loja.get("qtd", 0)
+                    if isinstance(qtd, (int, float)):
+                        total_qtd += int(qtd)
+            
+            # 2. MAPEAMENTO (TRADUÇÃO) BANCO -> FRONTEND
             mapped_part = {
                 "id": str(p.get("_id")),
                 "name": p.get("PRODUTO_NOME", "Nome Indisponível"),
                 "code": p.get("COD_FABRICANTE", p.get("SKU_ID", "")),
                 "brand": p.get("MARCA", "Genérica"),
-                "category": p.get("CATEGORIA", "Geral"),
-                "price_retail": p.get("PRECO_VENDA", 0.0),
                 "image": p.get("IMAGEM_URL", ""),
-                "compatible_vehicles": [p.get("APLICACAO_VEICULOS")] if isinstance(p.get("APLICACAO_VEICULOS"), str) else [],
                 
-                # Tratamento simples de estoque: Se não tiver campo de qtd, assume 10 para teste
-                # Futuramente, você deve somar o array 'ESTOQUE_REDE'
-                "quantity": 10 
+                # Campos de Preço (Enviando 'price' para compatibilidade com o card antigo)
+                "price": p.get("PRECO_VENDA", 0.0),       
+                "price_retail": p.get("PRECO_VENDA", 0.0), 
+                
+                # Campos de Estoque (Enviando 'quantity' com a SOMA TOTAL para o card não dar erro)
+                "quantity": total_qtd,      # <--- Isso corrige o "Sem estoque físico" no Desktop
+                "total_stock": total_qtd,   # <--- Usado pelo Vision/Mobile
+                "stock_locations": estoque_rede, # Detalhe por loja
+                
+                # Dados Extras
+                "application": p.get("APLICACAO_VEICULOS", "Aplicação não informada"),
+                "category": p.get("CATEGORIA", "Geral")
             }
             parts.append(mapped_part)
             
         return parts
+        
     except Exception as e:
-        print(f"Erro ao buscar peças: {e}")
+        print(f"❌ Erro ao buscar peças: {e}")
         return []
 
 @app.post("/api/ai/identify")
